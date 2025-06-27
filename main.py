@@ -1,152 +1,152 @@
-import asyncio
-from playwright.async_api import async_playwright
-import random
+import requests
+import re
 import json
-import os
+import html
 import subprocess
-from urllib.parse import urlparse, parse_qs
+import os
 
-COOKIES_FILE = "cookies.json"
-YOUTUBE_LINKS_FILE = "youtube_links.txt"
-ACCENT_CODES = {
-    "US": "us",
-    "UK": "uk",
-    "AUS": "au",
-    "CAN": "ca",
-    "IE": "ie",
-    "SCO": "gb-sco",
-    "NZ": "nz"
+ACCENTS = {
+    "1": "us",
+    "2": "uk",
+    "3": "aus",
+    "4": "can",
+    "5": "ei",
+    "6": "sco",
+    "7": "nz"
 }
 
-def extract_info_and_download(url, duration, output_file):
-    parsed_url = urlparse(url)
-    query = parse_qs(parsed_url.query)
+def choose_accent():
+    print("Выберите акцент:")
+    for key, val in ACCENTS.items():
+        print(f"{key}: {val.upper()}")
 
-    video_id = query.get('v', [None])[0]
-    if not video_id:
-        raise ValueError(f"❌ Не удалось найти параметр 'v' в ссылке: {url}")
+    choice = input("Введите номер акцента (по умолчанию 1 - US): ").strip()
+    return ACCENTS.get(choice, "us")
 
-    start_time = int(query.get('time_continue', [0])[0])
-    end_time = start_time + duration
-
-    normal_url = f"https://www.youtube.com/watch?v={video_id}"
-    print(f"⬇️ Скачиваем {output_file} с {start_time} до {end_time} сек")
-
-    command = [
-        "yt-dlp",
-        "--quiet", "--no-warnings",
-        "--download-sections", f"*{start_time}-{end_time}",
-        normal_url,
-        "-o", output_file
-    ]
-
-    subprocess.run(command, check=True)
-
-def random_user_agent():
-    agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_3_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
-    ]
-    return random.choice(agents)
-
-async def main():
-    word = input("🔤 Введите слово для произношения (например, hello): ").strip()
-    print("🎙️ Доступные акценты: US, UK, AUS, CAN, IE, SCO, NZ")
-    accent_input = input("🌍 Введите акцент (например, US): ").strip().upper()
-
-    if accent_input not in ACCENT_CODES:
-        print(f"❌ Неизвестный акцент: {accent_input}")
-        return
-
-    accent = ACCENT_CODES[accent_input]
+def fetch_json_data(word="could", accent="us"):
     url = f"https://youglish.com/pronounce/{word}/english/{accent}"
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        html_text = response.text
 
-    folder_name = word.lower()
-    os.makedirs(folder_name, exist_ok=True)
+        match = re.search(r'params\.jsonData\s*=\s*\'({.*?})\';', html_text, re.DOTALL)
+        if not match:
+            match = re.search(r'params\.jsonData\s*=\s*\'({.*)', html_text, re.DOTALL)
+            if match:
+                partial_json = match.group(1)
+                brace_count = 1
+                end_pos = 0
+                for i, char in enumerate(partial_json[1:], 1):
+                    if char == '{':
+                        brace_count += 1
+                    elif char == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            end_pos = i
+                            break
+                if end_pos > 0:
+                    raw_json = partial_json[:end_pos+1]
+                else:
+                    print("Не удалось найти корректное закрытие JSON")
+                    return None
+            else:
+                print("params.jsonData не найден в HTML.")
+                return None
+        else:
+            raw_json = match.group(1)
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
-        context = await browser.new_context(user_agent=random_user_agent())
-
-        if os.path.exists(COOKIES_FILE):
-            print("💾 Загружаем сохранённые cookies...")
-            cookies = json.load(open(COOKIES_FILE, "r"))
-            await context.add_cookies(cookies)
-
-        page = await context.new_page()
-        await page.goto(url)
+        raw_json = html.unescape(raw_json)
+        raw_json = raw_json.replace('\\"', '"')
+        raw_json = raw_json.replace('\\/', '/')
+        
+        clean_json = []
+        in_escape = False
+        for char in raw_json:
+            if char == '\\' and not in_escape:
+                in_escape = True
+            else:
+                clean_json.append(char)
+                in_escape = False
+        clean_json = ''.join(clean_json)
 
         try:
-            print("🔘 Ищем кнопку согласия на cookies...")
-            await page.wait_for_selector(
-                "body > div.fc-consent-root button.fc-cta-consent", timeout=5000
-            )
-            await page.click("body > div.fc-consent-root button.fc-cta-consent")
-            print("✅ Cookies приняты.")
-        except:
-            print("⚠️ Кнопка согласия не найдена или уже принята.")
+            data = json.loads(clean_json)
+            return data
+        except json.JSONDecodeError as e:
+            print(f"Ошибка при декодировании JSON (позиция {e.pos}): {e.msg}")
+            print(f"Контекст ошибки: {clean_json[e.pos-30:e.pos+30]}")
+            return None
+            
+    except requests.RequestException as e:
+        print(f"Ошибка при запросе к Youglish: {e}")
+        return None
 
-        cookies = await context.cookies()
-        json.dump(cookies, open(COOKIES_FILE, "w"), indent=2)
-        print("💾 Куки сохранены.")
+def download_videos(word, results):
+    folder = word.lower()
+    os.makedirs(folder, exist_ok=True)
 
-        youtube_links = []
+    for i, result in enumerate(results, 1):
+        vid = result.get("vid")
+        start = result.get("start")
+        end = result.get("end")
+        
+        if not vid or not start or not end:
+            print(f"Пропущен Result {i}: недостаточно данных")
+            continue
 
-        for i in range(5):
-            print(f"\n🔎 Обрабатываем пример №{i+1}...")
+        try:
+            youtube_url = f"https://www.youtube.com/watch?v={vid}"
+            section = f"*{start}-{end}"
+            video_path = os.path.join(folder, f"{word}_{i}.mp4")
+            audio_path = os.path.join(folder, f"{word}_{i}.ogg")
 
-            selector = '#all_actions > div:nth-child(1) > div:nth-child(2) > div:nth-child(1)'
-            await page.wait_for_selector(selector, timeout=10000)
+            command_video = [
+                "yt-dlp",
+                "--download-sections", section,
+                "--force-keyframes-at-cuts",
+                "--concurrent-fragments", "5",
+                "-f", "mp4",
+                youtube_url,
+                "-o", video_path
+            ]
+            print(f"Скачивание видео {i}: {youtube_url} → {video_path}")
+            subprocess.run(command_video, check=True)
 
-            container = await page.query_selector(selector)
-            if not container:
-                print("❌ Не найден элемент с YouTube ссылкой.")
-                break
+            command_audio = [
+                "ffmpeg",
+                "-y",
+                "-i", video_path,
+                "-vn",
+                "-acodec", "libvorbis",
+                audio_path
+            ]
+            subprocess.run(command_audio, check=True)
+            print(f"Успешно: {audio_path}")
 
-            link = await container.query_selector('a')
-            if not link:
-                print("❌ В элементе нет ссылки <a>.")
-                break
+            os.remove(video_path)
 
-            async with context.expect_page() as new_page_info:
-                await link.click()
-
-            new_page = await new_page_info.value
-            await new_page.wait_for_load_state()
-            youtube_url = new_page.url
-            print(f"✅ Получена ссылка на YouTube: {youtube_url}")
-            youtube_links.append(youtube_url)
-            await new_page.close()
-
-            if i < 4:
-                print("➡️ Нажимаем кнопку 'Next' для следующего примера...")
-                try:
-                    await page.wait_for_selector('#b_next', timeout=5000)
-                    await page.click('#b_next')
-                    await asyncio.sleep(2)
-                except Exception as e:
-                    print(f"❌ Не удалось нажать кнопку 'Next': {e}")
-                    break
-
-        # Сохраняем ссылки
-        with open(YOUTUBE_LINKS_FILE, "a") as f:
-            for link in youtube_links:
-                f.write(link + "\n")
-
-        print(f"\n💾 Все ссылки сохранены в {YOUTUBE_LINKS_FILE}")
-
-        # Скачиваем фрагменты видео
-        print("\n📥 Начинаем скачивание фрагментов YouTube...")
-        for idx, link in enumerate(youtube_links, start=1):
-            output_path = os.path.join(folder_name, f"{word.lower()}{idx}.mp4")
-            try:
-                extract_info_and_download(link, duration=8, output_file=output_path)
-            except Exception as e:
-                print(f"❌ Ошибка при скачивании {link}: {e}")
-
-        input("\n⏸️ Нажми Enter для завершения...")
-        await browser.close()
+        except subprocess.CalledProcessError as e:
+            print(f"Ошибка при скачивании/конвертации: {e}")
+        except Exception as e:
+            print(f"Ошибка: {e}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    word = input("Введите слово для поиска произношения: ").strip()
+    if not word:
+        print("Используется слово по умолчанию 'could'")
+        word = "could"
+
+    accent = choose_accent()
+    print(f"Выбран акцент: {accent.upper()}")
+
+    data = fetch_json_data(word, accent)
+    if data and "results" in data:
+        top_results = data["results"][:5]
+        download_videos(word, top_results)
+    else:
+        print("Не удалось получить данные с Youglish.")
