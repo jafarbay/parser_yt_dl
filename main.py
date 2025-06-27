@@ -94,9 +94,17 @@ def download_videos(word, results):
         vid = result.get("vid")
         start = result.get("start")
         end = result.get("end")
-        
-        if not vid or not start or not end:
+
+        if not vid or start is None or end is None:
             print(f"Пропущен Result {i}: недостаточно данных")
+            continue
+
+        # Добавляем 3 секунды к end
+        try:
+            start = float(start)
+            end = float(end) + 3.0
+        except ValueError:
+            print(f"Пропущен Result {i}: start/end не являются числами")
             continue
 
         try:
@@ -134,6 +142,7 @@ def download_videos(word, results):
             print(f"Ошибка при скачивании/конвертации: {e}")
         except Exception as e:
             print(f"Ошибка: {e}")
+
 
 if __name__ == "__main__":
     word = input("Введите слово для поиска произношения: ").strip()
