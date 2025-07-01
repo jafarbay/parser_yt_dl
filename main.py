@@ -4,6 +4,8 @@ import json
 import html
 import subprocess
 import os
+import asyncio
+import aiohttp
 
 ACCENTS = {
     "1": "us",
@@ -23,16 +25,17 @@ def choose_accent():
     choice = input("Введите номер акцента (по умолчанию 1 - US): ").strip()
     return ACCENTS.get(choice, "us")
 
-def fetch_json_data(word="could", accent="us"):
+async def fetch_json_data_async(word="could", accent="us"):
     url = f"https://youglish.com/pronounce/{word}/english/{accent}"
     headers = {
         "User-Agent": "Mozilla/5.0"
     }
     
     try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        html_text = response.text
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=10) as response:
+                response.raise_for_status()
+                html_text = await response.text()
 
         match = re.search(r'params\.jsonData\s*=\s*\'({.*?})\';', html_text, re.DOTALL)
         if not match:
@@ -82,69 +85,81 @@ def fetch_json_data(word="could", accent="us"):
             print(f"Контекст ошибки: {clean_json[e.pos-30:e.pos+30]}")
             return None
             
-    except requests.RequestException as e:
+    except aiohttp.ClientError as e:
         print(f"Ошибка при запросе к Youglish: {e}")
         return None
+    except asyncio.TimeoutError:
+        print("Таймаут запроса к Youglish.")
+        return None
+    except Exception as e:
+        print(f"Непредвиденная ошибка при получении JSON: {e}")
+        return None
 
-def download_videos(word, results):
-    folder = word.lower()
-    os.makedirs(folder, exist_ok=True)
+async def download_single_video_async(word, result, index, folder):
+    vid = result.get("vid")
+    start = result.get("start")
+    end = result.get("end")
 
-    for i, result in enumerate(results, 1):
-        vid = result.get("vid")
-        start = result.get("start")
-        end = result.get("end")
+    if not vid or start is None or end is None:
+        print(f"Пропущен Result {index}: недостаточно данных")
+        return
 
-        if not vid or start is None or end is None:
-            print(f"Пропущен Result {i}: недостаточно данных")
-            continue
+    try:
+        start = float(start)
+        end = float(end) + 3.0
+    except ValueError:
+        print(f"Пропущен Result {index}: start/end не являются числами")
+        return
 
-        # Добавляем 3 секунды к end
-        try:
-            start = float(start)
-            end = float(end) + 3.0
-        except ValueError:
-            print(f"Пропущен Result {i}: start/end не являются числами")
-            continue
+    try:
+        youtube_url = f"https://www.youtube.com/watch?v={vid}"
+        section = f"*{start}-{end}"
+        video_path = os.path.join(folder, f"{word}_{index}.mp4")
+        audio_path = os.path.join(folder, f"{word}_{index}.ogg")
 
-        try:
-            youtube_url = f"https://www.youtube.com/watch?v={vid}"
-            section = f"*{start}-{end}"
-            video_path = os.path.join(folder, f"{word}_{i}.mp4")
-            audio_path = os.path.join(folder, f"{word}_{i}.ogg")
+        print(f"Скачивание видео {index}: {youtube_url} → {video_path}")
+        proc_video = await asyncio.create_subprocess_exec(
+            "yt-dlp",
+            "--download-sections", section,
+            "--force-keyframes-at-cuts",
+            "--concurrent-fragments", "5",
+            "-f", "mp4",
+            youtube_url,
+            "-o", video_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout_video, stderr_video = await proc_video.communicate()
 
-            command_video = [
-                "yt-dlp",
-                "--download-sections", section,
-                "--force-keyframes-at-cuts",
-                "--concurrent-fragments", "5",
-                "-f", "mp4",
-                youtube_url,
-                "-o", video_path
-            ]
-            print(f"Скачивание видео {i}: {youtube_url} → {video_path}")
-            subprocess.run(command_video, check=True)
+        if proc_video.returncode != 0:
+            print(f"Ошибка yt-dlp для видео {index} (код {proc_video.returncode}):\n{stderr_video.decode()}")
+            raise subprocess.CalledProcessError(proc_video.returncode, "yt-dlp", output=stdout_video, stderr=stderr_video)
+        
+        proc_audio = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-y",
+            "-i", video_path,
+            "-vn",
+            "-acodec", "libvorbis",
+            audio_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout_audio, stderr_audio = await proc_audio.communicate()
 
-            command_audio = [
-                "ffmpeg",
-                "-y",
-                "-i", video_path,
-                "-vn",
-                "-acodec", "libvorbis",
-                audio_path
-            ]
-            subprocess.run(command_audio, check=True)
-            print(f"Успешно: {audio_path}")
+        if proc_audio.returncode != 0:
+            print(f"Ошибка ffmpeg для видео {index} (код {proc_audio.returncode}):\n{stderr_audio.decode()}")
+            raise subprocess.CalledProcessError(proc_audio.returncode, "ffmpeg", output=stdout_audio, stderr=stderr_audio)
 
-            os.remove(video_path)
+        os.remove(video_path)
+        print(f"Успешно: {audio_path}")
 
-        except subprocess.CalledProcessError as e:
-            print(f"Ошибка при скачивании/конвертации: {e}")
-        except Exception as e:
-            print(f"Ошибка: {e}")
+    except subprocess.CalledProcessError as e:
+        print(f"Ошибка при скачивании/конвертации видео {index}: {e}")
+    except Exception as e:
+        print(f"Общая ошибка для видео {index}: {e}")
 
-
-if __name__ == "__main__":
+async def main_async():
     word = input("Введите слово для поиска произношения: ").strip()
     if not word:
         print("Используется слово по умолчанию 'could'")
@@ -153,9 +168,20 @@ if __name__ == "__main__":
     accent = choose_accent()
     print(f"Выбран акцент: {accent.upper()}")
 
-    data = fetch_json_data(word, accent)
+    data = await fetch_json_data_async(word, accent)
     if data and "results" in data:
         top_results = data["results"][:5]
-        download_videos(word, top_results)
+        folder = word.lower()
+        os.makedirs(folder, exist_ok=True)
+
+        tasks = []
+        for i, result in enumerate(top_results, 1):
+            tasks.append(download_single_video_async(word, result, i, folder))
+        
+        await asyncio.gather(*tasks)
+        print(f"\nВсего скачано/обработано {len(top_results)} видео для слова '{word}'.")
     else:
         print("Не удалось получить данные с Youglish.")
+
+if __name__ == "__main__":
+    asyncio.run(main_async())
